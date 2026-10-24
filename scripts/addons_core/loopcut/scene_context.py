@@ -1,0 +1,280 @@
+"""What the user is looking at, attached to every message they send.
+
+Cursor knows which file is open and what is selected; "make this shinier" has to work here too.
+The block is added to the message the model receives, not to what the chat shows. @Name in a
+message pulls in that object, material or collection by name: @Table, @"Left Chair"; a text block or
+an image too (what a worker's brief owns: a recipe it must find, not "nothing has that name").
+
+Main thread only, except parse_mentions, candidates_from and the camera/light/keyframe line
+formatters (_camera_line, _light_line, _hex_color, _aim_target, _keyed_channels, _scene_facts),
+which only duck-type against bpy's attributes and so are pure too.
+"""
+
+import json
+import math
+import re
+
+MAX_SELECTED = 8
+MAX_MENTIONS = 5
+MAX_CHANGES = 12     # Lines of what the user changed since the agent's last step.
+DIGEST_OBJECTS = 20  # Up to this many objects, the block names them all: cheaper than a get_scene_info call.
+MAX_CAMERAS = 4       # Cameras, lights and animated objects listed in full below this...
+MAX_LIGHTS = 6
+MAX_ANIMATED = 8
+MAX_KEYS_SHOWN = 8       # ...frame numbers shown per keyed channel...
+MAX_CHANNELS_PER_OBJECT = 6  # ...and channels shown per object, before "+N more": a rig's fcurves
+                              # (one per bone per axis) would otherwise dwarf everything else here.
+_TRACK_CONSTRAINTS = ("TRACK_TO", "DAMPED_TRACK", "LOCKED_TRACK")
+_MENTION = re.compile(r'(?<![\w@])@(?:"([^"\n]+)"|([\w.\-]+))')
+
+
+def parse_mentions(text: str) -> list[str]:
+    """Names after @, in order, without duplicates."""
+    names = []
+    for quoted, bare in _MENTION.findall(text):
+        name = quoted or bare.rstrip(".-")  # "move @Cube." means Cube.
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def mention_prefix(text: str, cursor: int) -> str | None:
+    """The partial name being typed when the cursor sits right after `@par`, else None."""
+    start = text.rfind("@", 0, cursor)
+    if start < 0 or (start > 0 and not text[start - 1].isspace()):
+        return None
+    typed = text[start + 1:cursor]
+    if typed.startswith('"'):
+        return None if '"' in typed[1:] else typed[1:]
+    return typed if all(c.isalnum() or c in "._-" for c in typed) else None
+
+
+def candidates_from(names: list[tuple[str, str]], prefix: str, limit: int = 6) -> list[tuple[str, str]]:
+    """(name, kind) pairs matching what was typed: names starting with it first, then containing it."""
+    lowered = prefix.lower()
+    starts = [n for n in names if n[0].lower().startswith(lowered)]
+    contains = [n for n in names if lowered in n[0].lower() and n not in starts]
+    return (starts + contains)[:limit]
+
+
+def mention_text(name: str) -> str:
+    return f"@{name}" if all(c.isalnum() or c in "._-" for c in name) else f'@"{name}"'
+
+
+# ------------------------------------------------------------------ Blender side
+
+def all_names() -> list[tuple[str, str]]:
+    import bpy
+    scene = bpy.context.scene
+    selected = {o.name for o in bpy.context.view_layer.objects.selected}
+    objects = sorted(scene.objects, key=lambda o: (o.name not in selected, o.name.lower()))
+    from . import addons
+    return ([(o.name, "object") for o in objects]
+            + [(m.name, "material") for m in bpy.data.materials]
+            + [(c.name, "collection") for c in bpy.data.collections]
+            + [(a["name"], "add-on") for a in addons.enabled()])
+
+
+def _resolve(name: str):
+    import bpy
+    from . import addons
+    for kind, store in (("object", bpy.data.objects), ("material", bpy.data.materials),
+                        ("collection", bpy.data.collections), ("text", bpy.data.texts), ("image", bpy.data.images)):
+        if name in store:
+            return kind, store[name]
+    for entry in addons.enabled():
+        if entry["name"] == name or entry["module"] == name:
+            return "add-on", entry
+    return None, None
+
+
+def _describe_mention(name: str) -> str:
+    from . import object_info, tools
+    kind, found = _resolve(name)
+    if found is None:
+        return f"@{name}: nothing in this file has that name"
+    if kind == "object":
+        body = {**tools.object_summary(found), **object_info.describe(found)}
+    elif kind == "material":
+        body = object_info.describe_material(found)
+    elif kind in ("text", "image"):  # A brief may own one (a painter's recipe): say it is there, and what it holds.
+        from . import ownership
+        body = {"holds": ownership.support_about(found)}
+        if kind == "text":
+            body["starts"] = found.as_string()[:160]
+    elif kind == "add-on":
+        body = {"module": found["module"], "description": found["description"],
+                "operators": found["operators"][:40], "note": "inspect_api describes each operator"}
+        return f"@{name} is the add-on {found['name']!r}: {json.dumps(body, separators=(',', ':'))}"
+    else:
+        body = {"objects": [o.name for o in found.objects][:60],
+                "children": [c.name for c in found.children]}
+    text = json.dumps(body, separators=(",", ":"), default=str)
+    if len(text) > 3000:
+        text = text[:3000] + "... (get_object_info has the rest)"
+    return f"@{name} is the {kind} {found.name!r}: {text}"
+
+
+def _digest(objects, selected) -> str:
+    """Every other object by name for a small scene; counts by type for a big one."""
+    chosen = {o.name for o in selected}
+    if len(objects) <= DIGEST_OBJECTS:
+        others = [f"{o.name} ({o.type})" for o in objects if o.name not in chosen]
+        return "other objects: " + (", ".join(others) if others else "none")
+    counts: dict[str, int] = {}
+    for o in objects:
+        counts[o.type] = counts.get(o.type, 0) + 1
+    listed = ", ".join(f"{t} {n}" for t, n in sorted(counts.items(), key=lambda c: -c[1]))
+    return f"objects by type: {listed}. get_scene_info lists them."
+
+
+def _aim_target(obj) -> str | None:
+    """The target of a camera's first enabled Track To / Damped Track / Locked Track constraint,
+    if any: the closest thing to a live "aim point" once frame_camera has pointed it by rotation
+    alone (it does not create a constraint, so an aim set that way has nothing here to read back)."""
+    for constraint in obj.constraints:
+        if constraint.type in _TRACK_CONSTRAINTS and not constraint.mute and getattr(constraint, "target", None):
+            return constraint.target.name
+    return None
+
+
+def _camera_line(obj) -> str:
+    cam = obj.data
+    lens = f"ortho scale {cam.ortho_scale:g}" if cam.type == "ORTHO" else f"lens {cam.lens:g}mm"
+    parts = [lens, f"sensor_fit {cam.sensor_fit}", f"shift {cam.shift_x:g}/{cam.shift_y:g}"]
+    target = _aim_target(obj)
+    if target:
+        parts.append(f"tracks {target}")
+    return f"{obj.name}: " + ", ".join(parts)
+
+
+def _hex_color(color) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in color[:3])
+
+
+def _light_line(obj) -> str:
+    light = obj.data
+    parts = [light.type, f"color {_hex_color(light.color)}", f"energy {light.energy:g}"]
+    if light.type == "SPOT":
+        parts.append(f"spot size {math.degrees(light.spot_size):.1f}°")
+    return f"{obj.name}: " + ", ".join(parts)
+
+
+def _fcurves(obj):
+    """An object's fcurves, slotted (Blender 4.4+ layered actions) or the old single list."""
+    data = obj.animation_data
+    action = data.action if data else None
+    if action is None:
+        return []
+    slot = getattr(data, "action_slot", None)
+    if slot is not None and hasattr(action, "layers"):
+        curves = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                bag = strip.channelbag(slot)
+                if bag:
+                    curves += list(bag.fcurves)
+        return curves
+    return list(getattr(action, "fcurves", []))
+
+
+def _keyed_channels(obj) -> str | None:
+    """"<name>: <path> keys <frames>; ..." — the keyed channels (location, rotation, a bone's
+    path, ...) with their frame numbers, not values: exactly what a "make the middle faster"
+    follow-up needs, and the scene is the source of truth for the values anyway."""
+    frames_by_path: dict[str, set] = {}
+    for curve in _fcurves(obj):
+        frames_by_path.setdefault(curve.data_path, set()).update(round(k.co[0]) for k in curve.keyframe_points)
+    if not frames_by_path:
+        return None
+    paths = sorted(frames_by_path)
+    parts = []
+    for path in paths[:MAX_CHANNELS_PER_OBJECT]:
+        frames = sorted(frames_by_path[path])
+        shown = ", ".join(str(f) for f in frames[:MAX_KEYS_SHOWN])
+        if len(frames) > MAX_KEYS_SHOWN:
+            shown += f" (+{len(frames) - MAX_KEYS_SHOWN} more)"
+        parts.append(f"{path} keys {shown}")
+    if len(paths) > MAX_CHANNELS_PER_OBJECT:
+        parts.append(f"+{len(paths) - MAX_CHANNELS_PER_OBJECT} more channels")
+    return f"{obj.name}: " + "; ".join(parts)
+
+
+def _scene_facts(objects) -> list[str]:
+    """Camera lens/sensor fit/shift/aim, light colour/energy/spot size, and keyed channels by
+    frame: facts a timing, colour or composition follow-up needs, and that get_scene_info would
+    otherwise have to be called again to recover once the step that set them up has folded out of
+    the history. Capped so a big scene (or a rigged one) stays small: this is paid every message."""
+    lines = []
+    cameras = [o for o in objects if o.type == "CAMERA" and o.data]
+    if cameras:
+        lines.append("cameras:")
+        lines += ["  " + _camera_line(o) for o in cameras[:MAX_CAMERAS]]
+        if len(cameras) > MAX_CAMERAS:
+            lines.append(f"  ... and {len(cameras) - MAX_CAMERAS} more")
+    lights = [o for o in objects if o.type == "LIGHT" and o.data]
+    if lights:
+        lines.append("lights:")
+        lines += ["  " + _light_line(o) for o in lights[:MAX_LIGHTS]]
+        if len(lights) > MAX_LIGHTS:
+            lines.append(f"  ... and {len(lights) - MAX_LIGHTS} more")
+    animated = [o for o in objects if o.animation_data and o.animation_data.action]
+    keyed = [line for line in (_keyed_channels(o) for o in animated[:MAX_ANIMATED]) if line]
+    if keyed:
+        lines.append("animated (keyed channels, frame numbers):")
+        lines += ["  " + line for line in keyed]
+        if len(animated) > MAX_ANIMATED:
+            lines.append(f"  ... and {len(animated) - MAX_ANIMATED} more animated objects")
+    return lines
+
+
+def _since_last_step(since: dict | None) -> list[str]:
+    """What changed in the scene since the agent last acted: the user's own edits, which the
+    model would otherwise learn of only by reading the scene again. A delta, not a listing."""
+    from . import scene_diff
+    if since is None:
+        return []
+    changes = scene_diff.diff(since, scene_diff.snapshot())
+    if scene_diff.is_empty(changes):
+        return []
+    listed = scene_diff.lines(changes)
+    if len(listed) > MAX_CHANGES:
+        listed = listed[:MAX_CHANGES] + [f"... and {len(listed) - MAX_CHANGES} more; get_scene_info changed_only=true lists them"]
+    return ["changed since your last step (by the user, not you):"] + ["  " + line for line in listed]
+
+
+def for_message(text: str, since: dict | None = None) -> str:
+    """The context block for one user message. Small on purpose: it is paid for on every turn.
+    `since` is the scene_diff snapshot from the end of the agent's previous step, if any."""
+    import bpy
+    from . import capabilities, tools
+    scene = bpy.context.scene
+    view_layer = bpy.context.view_layer
+    active = view_layer.objects.active
+    selected = list(view_layer.objects.selected)
+    file_name = bpy.path.basename(bpy.data.filepath) or "unsaved scene"
+    lines = [f"file: {file_name} | mode: {bpy.context.mode} | frame: {scene.frame_current} | "
+             f"objects: {len(scene.objects)} | active: {active.name if active else 'none'}"]
+    engines = capabilities.render_engines(scene.render)
+    lines.append(f"Blender {bpy.app.version_string} | render engines: {', '.join(engines)} | "
+                 f"current: {scene.render.engine} | camera: {scene.camera.name if scene.camera else 'none'}")
+    lines.append(f"output: {scene.render.resolution_x}x{scene.render.resolution_y} at "
+                 f"{scene.render.resolution_percentage}% | {scene.render.image_settings.file_format} | "
+                 f"frames: {scene.frame_start}-{scene.frame_end} | fps: "
+                 f"{scene.render.fps / scene.render.fps_base:g}")
+    lines.append(f"media type: {getattr(scene.render.image_settings, 'media_type', 'unknown')} | "
+                 f"video encoding available: {bpy.app.ffmpeg.supported} | "
+                 "editors: " + ", ".join(sorted({a.ui_type for w in bpy.context.window_manager.windows
+                                                 for a in w.screen.areas})))
+    if selected:
+        lines.append(f"selected ({len(selected)}), which is what \"this\", \"it\" and \"these\" mean:")
+        lines += ["  " + json.dumps(tools.object_summary(o), separators=(",", ":")) for o in selected[:MAX_SELECTED]]
+        if len(selected) > MAX_SELECTED:
+            lines.append(f"  ... and {len(selected) - MAX_SELECTED} more")
+    else:
+        lines.append("selected: nothing")
+    lines.append(_digest(scene.objects, selected))
+    lines += _scene_facts(scene.objects)
+    lines += _since_last_step(since)
+    lines += [_describe_mention(name) for name in parse_mentions(text)[:MAX_MENTIONS]]
+    return "<scene_context>\n" + "\n".join(lines) + "\n</scene_context>"

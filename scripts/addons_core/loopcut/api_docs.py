@@ -1,0 +1,640 @@
+"""inspect_api: the Blender Python API as it exists in the running Blender.
+
+Models learned bpy from years of scripts written for older versions, and they guess: a renamed
+property, a node socket that moved, an operator argument that is gone. Blender can describe its
+own API exactly (RNA carries every type, property, enum value and operator argument), so the
+agent asks instead of guessing. No network, no bundled docs to go stale.
+
+Main thread only: node sockets are read by briefly creating the node in a scratch node tree.
+"""
+
+import difflib
+import inspect
+import re
+from dataclasses import dataclass, field
+
+import bpy
+
+from . import bundled_addons, capabilities, op_notes, scene_diff
+
+MAX_CHARS = 6000
+MAX_SEARCH_RESULTS = 40
+MAX_PARTIAL_RESULTS = 10  # When nothing matches every word: the best few by words matched.
+_NODE_TREES = ("ShaderNodeTree", "GeometryNodeTree", "CompositorNodeTree", "TextureNodeTree")
+_index: list[tuple[str, str]] | None = None  # (path, lowercased text to match against)
+_index_key: tuple = ()  # What was registered when the index was built; an add-on enabled since rebuilds it.
+
+
+class ApiError(Exception):
+    """The path or query made no sense; the message says what would."""
+
+
+def _socket_types() -> list[str]:
+    return sorted(name for name in dir(bpy.types)
+                  if name.startswith("NodeSocket") and "Virtual" not in name and "Interface" not in name
+                  and name not in ("NodeSocket", "NodeSocketStandard"))
+
+
+# RNA lists only a placeholder for enums whose items Blender computes at run time, and a model
+# told that `socket_type` is one of ['DEFAULT'] will believe it. Where the real values can be
+# read from the running Blender, say them. Key: (struct, function or "", property).
+_DYNAMIC_ENUMS = {
+    ("NodeTreeInterface", "new_socket", "socket_type"): _socket_types,
+    ("RenderSettings", "", "engine"): lambda: capabilities.render_engines(bpy.context.scene.render),
+}
+
+# The few places where the API of recent versions differs from what most scripts online (and so
+# most models) assume, stated once where the model will look. harness/api_docs_check.py runs the
+# code in each note against the running Blender, so a note cannot outlive the API it describes.
+NOTES = {
+    "ImageFormatSettings": (
+        "In Blender 5.2, file_format depends on media_type. IMAGE lists only still formats; this "
+        "does not mean video encoding is unavailable. For MP4 output (when bpy.app.ffmpeg.supported):\n"
+        "  r = bpy.context.scene.render\n"
+        "  r.image_settings.media_type = 'VIDEO'\n"
+        "  r.image_settings.file_format = 'FFMPEG'\n"
+        "  r.ffmpeg.format = 'MPEG4'; r.ffmpeg.codec = 'H264'\n"
+        "For PNG output set media_type = 'IMAGE' before file_format = 'PNG'.\n"
+        "To check the frames of an MP4 you rendered, no ffmpeg or pip package is needed: in a background "
+        "Blender, add it to a new scene as a movie strip (scene.sequence_editor_create().strips.new_movie(name, "
+        "filepath, channel=1, frame_start=1)) and render the frames you want as PNG stills."),
+    "NodeTree": (
+        "Group inputs and outputs are made on the interface, not tree.inputs/outputs:\n"
+        "  tree.interface.new_socket('Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')\n"
+        "  tree.interface.new_socket('Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')\n"
+        "  group_in, group_out = tree.nodes.new('NodeGroupInput'), tree.nodes.new('NodeGroupOutput')\n"
+        "  tree.links.new(group_in.outputs[0], group_out.inputs[0])"),
+    "Action": (
+        "Actions are layered and slotted; there is no action.fcurves. For an object's curves:\n"
+        "  slot = obj.animation_data.action_slot\n"
+        "  bag = action.layers[0].strips[0].channelbag(slot)   # None if nothing is keyed for the slot\n"
+        "  for fcurve in bag.fcurves: ...\n"
+        "obj.keyframe_insert('location', frame=1) creates the action, slot, layer and strip as needed. "
+        "A slot has no name: slot.identifier is 'OBCube', slot.name_display 'Cube'."),
+}
+# Types a model reaches for on its way to what a note covers show that note too: after
+# "'Action' object has no attribute 'fcurves'" it looked up ActionLayer, ActionSlot, AnimData, ...
+_NOTE_ALSO = {"AnimData": "Action", "ActionSlot": "Action", "ActionLayer": "Action", "ActionStrip": "Action",
+              "ActionChannelbag": "Action"}
+
+
+def note_for(rna) -> str:
+    """The note for an RNA struct, one of its bases, or a type on the way to it; "" for none."""
+    while rna is not None:
+        name = _NOTE_ALSO.get(rna.identifier, rna.identifier)
+        if name in NOTES:
+            return NOTES[name]
+        rna = rna.base
+    return ""
+
+
+# Blender expands // in its own paths only: the glTF, FBX, OBJ, STL and USD exporters open '//x.glb'
+# as it is, which is /x.glb (Blender 5.2.2), and a glb export failed that way in the evals of 2026-09-27.
+BLEND_RELATIVE = ("Exporters and open() do not expand // (next to the .blend): pass "
+                  "bpy.path.abspath('//name.glb'), which needs the .blend saved.")
+
+
+def error_note(ex: BaseException) -> str:
+    """Best-effort facts appended to run_python's original error; diagnostics must never replace it."""
+    try:
+        return _error_note(ex)
+    except Exception:
+        # Intentional diagnostic boundary: even stale RNA or an exception's broken __str__ must
+        # leave the original traceback intact. No scene values or exception text are logged here.
+        return ""
+
+
+def _error_note(ex: BaseException) -> str:
+    message = str(ex)
+    named = re.match(r"'(\w+)' object", message) if isinstance(ex, (AttributeError, TypeError)) else None
+    rna = getattr(getattr(bpy.types, named[1], None), "bl_rna", None) if named else None
+    if rna is not None:
+        note = note_for(rna)
+        if note:
+            return note
+        missing = re.fullmatch(r"'\w+' object has no attribute '(\w+)'", message)
+        receiver = getattr(ex, "obj", None)  # Set by Python 3.10+ for most AttributeErrors.
+        struct = getattr(bpy.types, "bpy_struct", None)
+        if receiver is not None and struct is not None and not isinstance(receiver, struct):
+            missing = None  # A user class that happens to share a Blender type's name.
+        if isinstance(ex, AttributeError) and missing and len(missing[1]) <= 128:
+            note = _attribute_note(rna.identifier, missing[1])
+            if note:
+                return note
+    return BLEND_RELATIVE if re.search(r"(?:^|[\s'\"])//[^/\s'\"]", message) else ""
+
+
+@dataclass
+class _ErrorIndex:
+    # Strings only: no RNA handles survive add-on unregisters. This snapshot is built once per
+    # module session; registrations after the first error are intentionally outside its scope.
+    names: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    owners: dict[str, set[str]] = field(default_factory=dict)  # attribute -> struct identifiers
+    bases: dict[str, set[str]] = field(default_factory=dict)
+    stems: dict[str, set[str]] = field(default_factory=dict)
+    links: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # owner -> (target, suffix)
+    access: dict[str, str] = field(default_factory=dict)  # one representative RNA access path
+    paths: dict[str, dict[str, str]] = field(default_factory=dict)  # queried owner -> reachable types
+
+
+_error_index: _ErrorIndex | None = None
+
+
+def _rna_stem(name: str) -> str:
+    """Final CamelCase word: Bone, PoseBone and EditBone share 'Bone'; BoneMeal does not."""
+    words = re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", name)
+    return words[-1] if words else name
+
+
+def _rna_paths(source: str, links: dict):
+    """At most two property hops (Object.pose.bones), with collections marked as item access.
+    These are type-level paths: no instance is created, traversed, or claimed to exist."""
+    for target, suffix in links.get(source, ()):
+        if target == source:
+            continue
+        path = source + "." + suffix
+        yield target, path, 1
+        for child, child_suffix in links.get(target, ()):
+            if child not in (source, target):
+                yield child, path + "." + child_suffix, 2
+
+
+def _build_error_index() -> _ErrorIndex:
+    index = _ErrorIndex()
+    for name in dir(bpy.types):
+        cls = getattr(bpy.types, name)
+        rna = getattr(cls, "bl_rna", None)
+        if rna is None or rna.identifier in index.names:
+            continue
+        identifier = rna.identifier
+        names = {p.identifier for p in rna.properties} | {f.identifier for f in rna.functions} | set(dir(cls))
+        index.names[identifier] = tuple(sorted(n for n in names if not n.startswith("_")
+                                               and n not in ("bl_rna", "rna_type")))
+        for attribute in index.names[identifier]:
+            index.owners.setdefault(attribute, set()).add(identifier)
+        bases, base = set(), rna.base
+        while base is not None and base.identifier not in bases:
+            bases.add(base.identifier)
+            base = base.base
+        index.bases[identifier] = bases
+        index.stems.setdefault(_rna_stem(identifier), set()).add(identifier)
+        links = []
+        for prop in rna.properties:
+            if prop.identifier == "rna_type" or prop.type not in ("POINTER", "COLLECTION"):
+                continue
+            if prop.fixed_type is not None:
+                suffix = prop.identifier + ("[...]" if prop.type == "COLLECTION" else "")
+                links.append((prop.fixed_type.identifier, suffix))
+            # Collection methods belong to the wrapper, e.g. Object.modifiers.new, not its items.
+            if prop.type == "COLLECTION" and getattr(prop, "srna", None) is not None:
+                links.append((prop.srna.identifier, prop.identifier))
+        index.links[identifier] = sorted(links)
+
+    # Prefer an ID-rooted path (Object.pose.bones) over a nested struct (Pose.bones), then the
+    # shortest path. ID is Blender's data-block base, not a table of API migrations.
+    ranked = {}
+    for source in index.links:
+        for target, path, depth in _rna_paths(source, index.links):
+            rank = ("ID" not in index.bases[source], depth, len(path), path)
+            if target not in ranked or rank < ranked[target]:
+                ranked[target] = rank
+                index.access[target] = path
+    return index
+
+
+def _note_line(label: str, entries: list[str]) -> str:
+    """Keep complete identifiers and paths, within one short line."""
+    shown = []
+    for entry in entries[:5]:
+        if len(label) + len(", ".join([*shown, entry])) > 310:
+            break
+        shown.append(entry)
+    if not shown:
+        return ""
+    return label + ", ".join(shown) + (", ..." if len(shown) < len(entries) else ".")
+
+
+def _attribute_note(identifier: str, attribute: str) -> str:
+    global _error_index
+    if _error_index is None:
+        _error_index = _build_error_index()
+    index = _error_index
+    # difflib runs only on this struct's members, never all of Blender's attribute names.
+    close = difflib.get_close_matches(attribute, index.names.get(identifier, ()), n=5, cutoff=0.5)
+    close = [name for name in close if name != attribute]
+    if identifier not in index.paths:
+        paths = {}
+        for target, path, depth in sorted(_rna_paths(identifier, index.links), key=lambda p: (p[2], len(p[1]), p[1])):
+            paths.setdefault(target, path)
+        index.paths[identifier] = paths
+    paths = index.paths[identifier]
+    related = index.stems.get(_rna_stem(identifier), set()) | index.bases.get(identifier, set()) | paths.keys()
+    owners = (index.owners.get(attribute, set()) & related) - {identifier}
+    entries = []
+    for owner in sorted(owners):
+        path = paths.get(owner) or index.access.get(owner)
+        entries.append(f"{owner}.{attribute}" + (f" via {path}" if path else ""))
+    return "\n".join(line for line in (_note_line(f"Closest on {identifier}: ", close),
+                                     _note_line("Related types: ", entries)) if line)
+
+
+# ------------------------------------------------------------------ formatting RNA
+
+def _type_of(prop, owner: tuple[str, str] = ("", "")) -> str:
+    kind = prop.type
+    if kind == "ENUM":
+        values = [item.identifier for item in prop.enum_items]
+        dynamic = _DYNAMIC_ENUMS.get((*owner, prop.identifier))
+        if dynamic:
+            values = dynamic()
+        elif len(values) <= 1:
+            return "enum (values are computed at run time; assigning a wrong one raises a TypeError listing the valid ones)"
+        shown = ", ".join(repr(v) for v in values[:24]) + (", ..." if len(values) > 24 else "")
+        return ("set of " if prop.is_enum_flag else "enum ") + f"[{shown}]"
+    if kind in ("POINTER", "COLLECTION"):
+        target = prop.fixed_type.identifier if prop.fixed_type else "?"
+        return f"bpy.types.{target}" if kind == "POINTER" else f"collection of bpy.types.{target}"
+    text = kind.lower()
+    if kind in ("INT", "FLOAT", "BOOLEAN") and getattr(prop, "array_length", 0):
+        text += f"[{prop.array_length}]"
+    if kind in ("INT", "FLOAT"):
+        if prop.subtype not in ("NONE", ""):
+            text += f" {prop.subtype.lower()}"
+        low, high = prop.hard_min, prop.hard_max
+        if low > -1e9 or high < 1e9:
+            text += f" in [{low:g}, {high:g}]"
+    return text
+
+
+def _default_of(prop) -> str:
+    kind = prop.type
+    try:
+        if kind == "ENUM":
+            return repr(set(prop.default_flag)) if prop.is_enum_flag else repr(prop.default)
+        if kind in ("INT", "FLOAT", "BOOLEAN"):
+            if getattr(prop, "array_length", 0):
+                return repr(scene_diff.rounded_value(prop.default_array, 4))  # A matrix's too.
+            return repr(scene_diff.rounded_value(prop.default, 4))
+        if kind == "STRING":
+            return repr(prop.default)
+    except (AttributeError, TypeError):
+        pass
+    return ""
+
+
+def _property_line(prop, with_default=True, owner: tuple[str, str] = ("", "")) -> str:
+    line = f"  {prop.identifier}: {_type_of(prop, owner)}"
+    default = _default_of(prop) if with_default else ""
+    if default not in ("", "''"):
+        line += f" = {default}"
+    if prop.is_readonly:
+        line += " (read-only)"
+    if getattr(prop, "is_deprecated", False):
+        line += f" (DEPRECATED: {prop.deprecated_note})"
+    if prop.description:
+        line += f"  # {prop.description}"
+    return line
+
+
+def _function_line(function) -> str:
+    inputs = [p for p in function.parameters if not p.is_output]
+    outputs = [p for p in function.parameters if p.is_output]
+    arguments = ", ".join(p.identifier + ("" if p.is_required else "=...") for p in inputs)
+    line = f"  {function.identifier}({arguments})"
+    if outputs:
+        line += " -> " + ", ".join(_type_of(p) for p in outputs)
+    if function.description:
+        line += f"  # {function.description}"
+    return line
+
+
+def _python_members(cls, rna) -> dict:
+    """What a bpy.types class defines in Python, which RNA does not list: Mesh.from_pydata,
+    Object.children. inspect_api said Mesh has no from_pydata (eval, 2026-09-27)."""
+    members = {}
+    for klass in reversed(getattr(cls, "__mro__", ())):
+        members.update((name, value) for name, value in vars(klass).items() if not name.startswith("_")
+                       and (inspect.isfunction(value) or isinstance(value, (property, classmethod, staticmethod))))
+    return {name: value for name, value in members.items() if name not in rna.properties and name not in rna.functions}
+
+
+def _python_line(name: str, value) -> str:
+    function = value.fget if isinstance(value, property) else getattr(value, "__func__", value)
+    if isinstance(value, property):
+        line = f"  {name}" + (" (read-only)" if value.fset is None else "")
+    else:
+        try:
+            signature = inspect.signature(function)
+            parameters = list(signature.parameters.values())
+            if parameters and parameters[0].name in ("self", "cls"):
+                signature = signature.replace(parameters=parameters[1:])
+            line = f"  {name}{signature}"
+        except (TypeError, ValueError):
+            line = f"  {name}(...)"
+    doc = (inspect.getdoc(function) or "").splitlines()
+    return line + (f"  # {doc[0]}" if doc else "")
+
+
+def _own_properties(rna) -> list:
+    inherited = {p.identifier for p in rna.base.properties} if rna.base else set()
+    return [p for p in rna.properties if p.identifier != "rna_type" and p.identifier not in inherited]
+
+
+def _node_sockets(identifier: str) -> list[str]:
+    """Inputs and outputs only exist on a node instance, so make one in a scratch tree."""
+    for tree_type in _NODE_TREES:
+        try:
+            tree = bpy.data.node_groups.new(".loopcut_inspect", tree_type)
+        except (RuntimeError, TypeError):
+            continue
+        try:
+            try:
+                node = tree.nodes.new(identifier)
+            except RuntimeError:
+                continue
+            lines = [f"As a node in a {tree_type} (nodes.new({identifier!r})):"]
+            for title, sockets in (("inputs", node.inputs), ("outputs", node.outputs)):
+                lines.append(f" {title}:")
+                for index, socket in enumerate(sockets):
+                    if not socket.enabled:
+                        continue
+                    line = f"  [{index}] {socket.name!r} ({socket.bl_idname})"
+                    if socket.identifier != socket.name:
+                        line += f" identifier={socket.identifier!r}"
+                    value = getattr(socket, "default_value", None)
+                    if title == "inputs" and value is not None:
+                        line += f" = {scene_diff.rounded_value(value, 4)!r}"
+                    lines.append(line)
+            return lines
+        finally:
+            bpy.data.node_groups.remove(tree)
+    return []
+
+
+def _describe_struct(cls) -> list[str]:
+    return _describe_rna(cls.bl_rna, cls)
+
+
+def _describe_rna(rna, cls=None) -> list[str]:
+    lines = [f"bpy.types.{rna.identifier}" + (f"({rna.base.identifier})" if rna.base else "")]
+    if rna.description:
+        lines.append(rna.description)
+    # First: a few lines, and a long type (Mesh, Object) is cut at MAX_CHARS long before its end.
+    python = _python_members(cls, rna) if cls else {}
+    if python and rna.base:  # Only what this class adds: Panel.append is not repeated on every panel.
+        base = getattr(bpy.types, rna.base.identifier, None)
+        inherited = _python_members(base, rna.base) if base else {}
+        python = {name: value for name, value in python.items() if inherited.get(name) is not value}
+    if python:
+        lines.append("defined in Python:")
+        lines += [_python_line(name, value) for name, value in python.items()]
+    own = _own_properties(rna)
+    if own:
+        lines.append("properties:")
+        lines += [_property_line(p, owner=(rna.identifier, "")) for p in own]
+    functions = [f for f in rna.functions if not rna.base or f.identifier not in rna.base.functions]
+    if functions:
+        lines.append("functions:")
+        lines += [_function_line(f) for f in functions]
+    if rna.base:
+        names = [p.identifier for p in rna.base.properties if p.identifier != "rna_type"]
+        lines.append(f"inherited from {rna.base.identifier} (inspect it for details): {', '.join(names)}")
+    subclasses = sorted(c.bl_rna.identifier for c in cls.__subclasses__() if hasattr(c, "bl_rna")) if cls else []
+    if subclasses:
+        lines.append(f"subtypes ({len(subclasses)}): {', '.join(subclasses[:60])}"
+                     + (", ..." if len(subclasses) > 60 else ""))
+    if cls and issubclass(cls, bpy.types.Node):
+        lines += _node_sockets(rna.identifier)
+    if note_for(rna):
+        lines.append("NOTE: " + note_for(rna))
+    return lines
+
+
+def _describe_operator(module: str, name: str) -> list[str]:
+    operator = getattr(getattr(bpy.ops, module), name)
+    try:
+        rna = operator.get_rna_type()
+    except KeyError as ex:
+        raise ApiError(f"No operator bpy.ops.{module}.{name}. "
+                       f"inspect_api('bpy.ops.{module}') lists that module.") from ex
+    arguments = [p for p in rna.properties if p.identifier != "rna_type"]
+    lines = [f"bpy.ops.{module}.{name}({', '.join(p.identifier + '=...' for p in arguments)})"]
+    if rna.description:
+        lines.append(rna.description)
+    lines += ["NOTE: " + text for _, text in op_notes.NOTES.get(f"{module}.{name}", ())]
+    lines.append("Operators depend on context (mode, selection, active object) and raise "
+                 "RuntimeError when their poll fails; prefer the data API when it can do the job.")
+    if arguments:
+        lines.append("arguments (all optional keywords):")
+        lines += [_property_line(p) for p in arguments]
+    return lines
+
+
+def _describe_python(path: str, obj) -> list[str]:
+    lines = [path]
+    try:
+        lines[0] += str(inspect.signature(obj))
+    except (TypeError, ValueError):
+        pass
+    doc = inspect.getdoc(obj)
+    if doc:
+        lines.append(doc)
+    if inspect.ismodule(obj) or inspect.isclass(obj):
+        members = [n for n in dir(obj) if not n.startswith("_")]
+        lines.append(f"members: {', '.join(members)}")
+    return lines
+
+
+# ------------------------------------------------------------------ lookup
+
+def _closest(name: str) -> str:
+    """Type names near a wrong guess: GeometryNodeMeshIcosahedron -> ...MeshIcoSphere."""
+    import difflib
+    candidates = [n for n in dir(bpy.types) if hasattr(getattr(bpy.types, n), "bl_rna")]
+    close = difflib.get_close_matches(name, candidates, n=6, cutoff=0.6)
+    words = [w.lower() for w in re.findall(r"[A-Z][a-z0-9]+|[a-z0-9]+", name)][-2:]
+    close += [n for n in candidates if n not in close and all(w in n.lower() for w in words)][:6]
+    return f" Closest type names: {', '.join(close[:10])}." if close else ""
+
+
+def _walk_rna(cls, names: list[str], rna=None) -> list[str]:
+    """Follow property names from an RNA type: Object -> modifiers -> (the collection's type).
+    rna without cls: a struct with no bpy.types class (_unexposed)."""
+    rna = cls.bl_rna if rna is None else rna
+    for position, name in enumerate(names):
+        if name in rna.functions:
+            return [f"bpy.types.{rna.identifier}.{name}", _function_line(rna.functions[name]).strip(),
+                    *("  " + _property_line(p, with_default=False, owner=(rna.identifier, name)).strip()
+                      for p in rna.functions[name].parameters)]
+        prop = rna.properties.get(name)
+        python = _python_members(cls, rna) if prop is None and cls else {}
+        if name in python:
+            return [f"bpy.types.{rna.identifier}.{name} (defined in Python)", _python_line(name, python[name]).strip()]
+        if prop is None:
+            note = note_for(rna)  # Action.fcurves: the note says where they went.
+            raise ApiError(f"bpy.types.{rna.identifier} has no property or function {name!r}. "
+                           + (f"NOTE: {note}\n" if note else "") + "It has: "
+                           + ", ".join([p.identifier for p in rna.properties if p.identifier != "rna_type"]
+                                       + list(python)))
+        if prop.type not in ("POINTER", "COLLECTION") or prop.fixed_type is None:
+            lines = [f"bpy.types.{rna.identifier}.{name}", _property_line(prop, owner=(rna.identifier, "")).strip()]
+            if note_for(rna):
+                lines.append("NOTE: " + note_for(rna))
+            return lines
+        header = f"bpy.types.{rna.identifier}.{name} is a {_type_of(prop)}"
+        # A collection's own methods (new, remove, link, ...) live on a separate RNA struct.
+        rna = prop.srna or prop.fixed_type
+        # Python add-ons can register RNA structs without exposing a bpy.types attribute
+        # (e.g. Scene.cycles -> CyclesRenderSettings). The RNA itself is authoritative.
+        cls = getattr(bpy.types, rna.identifier, None)
+        if position == len(names) - 1:
+            described = _describe_rna(rna, cls)
+            if prop.srna and prop.fixed_type:
+                described.append(f"items are bpy.types.{prop.fixed_type.identifier}")
+            return [header, *described]
+    return _describe_rna(rna, cls)
+
+
+def _resolve(path: str) -> list[str]:
+    parts = path.split(".")
+    if parts[0] != "bpy" and hasattr(bpy.types, parts[0]):
+        parts = ["bpy", "types", *parts]  # "BevelModifier" and "Object.modifiers" are enough.
+    if parts[:2] == ["bpy", "ops"]:
+        if len(parts) == 2:
+            return ["bpy.ops modules: " + ", ".join(sorted(dir(bpy.ops)))]
+        if parts[2] not in dir(bpy.ops):
+            raise ApiError(f"No operator module bpy.ops.{parts[2]}. Modules: {', '.join(sorted(dir(bpy.ops)))}")
+        if len(parts) == 3:
+            return [f"bpy.ops.{parts[2]}: " + ", ".join(sorted(dir(getattr(bpy.ops, parts[2]))))]
+        return _describe_operator(parts[2], parts[3])
+    if parts[:2] == ["bpy", "types"] and len(parts) >= 3:
+        cls = getattr(bpy.types, parts[2], None)
+        if cls is None or not hasattr(cls, "bl_rna"):
+            rna, owners = _unexposed(parts[2])
+            if rna is None:
+                raise ApiError(f"No type bpy.types.{parts[2]}.{_closest(parts[2])}")
+            return [f"{parts[2]} has no bpy.types name (an add-on registered it); reach it as "
+                    f"{', '.join(owners[:4])}.", *_walk_rna(None, parts[3:], rna)]
+        return _walk_rna(cls, parts[3:])
+    # Plain Python: bpy.data, bpy.context, bmesh, mathutils, bpy_extras, ...
+    import importlib
+    try:
+        obj = importlib.import_module(parts[0])
+    except ImportError as ex:
+        if _unexposed(parts[0])[0] is not None:
+            return _resolve(f"bpy.types.{path}")
+        raise ApiError(f"Nothing called {parts[0]!r}.{_closest(parts[0])} Paths look like bpy.types.Object, "
+                       f"bpy.ops.mesh.subdivide, bmesh.ops.bevel, mathutils.Vector.") from ex
+    walked = parts[0]
+    for position, name in enumerate(parts[1:], start=1):
+        if hasattr(type(obj), "bl_rna") and not inspect.isclass(obj):
+            return _walk_rna(type(obj), parts[position:])  # bpy.data.objects, bpy.context.scene.render, ...
+        if not hasattr(obj, name):
+            raise ApiError(f"{walked} has no attribute {name!r}. It has: "
+                           + ", ".join(n for n in dir(obj) if not n.startswith("_")))
+        obj, walked = getattr(obj, name), f"{walked}.{name}"
+    if hasattr(type(obj), "bl_rna") and not inspect.isclass(obj):
+        return [f"{walked} is a bpy.types.{type(obj).bl_rna.identifier}", *_describe_struct(type(obj))]
+    return _describe_python(walked, obj)
+
+
+def _unexposed(name: str) -> tuple:
+    """(rna, ["Scene.cycles", ...]) for a struct Python add-ons registered without a bpy.types
+    attribute (CyclesRenderSettings), found as the type of a property; (None, []) if there is none."""
+    rna, owners = None, []
+    for owner in dir(bpy.types):
+        struct = getattr(getattr(bpy.types, owner), "bl_rna", None)
+        for prop in struct.properties if struct is not None else ():
+            if prop.type == "POINTER" and prop.fixed_type and prop.fixed_type.identifier == name:
+                rna = prop.fixed_type
+                owners.append(f"{owner}.{prop.identifier}")
+    return rna, owners
+
+
+def _registered_key() -> tuple:
+    """Changes when an add-on is enabled or disabled, or a script registers a class: the index
+    built before that would not know the new operators. dir(bpy.types) is about a millisecond."""
+    return len(dir(bpy.types)), tuple(bpy.context.preferences.addons.keys())
+
+
+def _build_index() -> list[tuple[str, str]]:
+    entries = []
+    for name in dir(bpy.types):
+        cls = getattr(bpy.types, name)
+        rna = getattr(cls, "bl_rna", None)
+        if rna is None:
+            continue
+        entries.append((f"bpy.types.{name}", f"{name} {rna.name} {rna.description}".lower()))
+        for prop in _own_properties(rna):
+            entries.append((f"bpy.types.{name}.{prop.identifier}",
+                            f"{name}.{prop.identifier} {prop.name} {prop.description}".lower()))
+    for module in dir(bpy.ops):
+        for operator in dir(getattr(bpy.ops, module)):
+            try:
+                rna = getattr(getattr(bpy.ops, module), operator).get_rna_type()
+            except KeyError:
+                continue
+            entries.append((f"bpy.ops.{module}.{operator}",
+                            f"{module}.{operator} {rna.name} {rna.description}".lower()))
+    return entries
+
+
+def _search(query: str) -> list[str]:
+    global _index, _index_key
+    terms = query.lower().split()
+    if not terms:
+        raise ApiError("search needs at least one word.")
+    key = _registered_key()
+    if _index is None or key != _index_key:
+        _index, _index_key = _build_index(), key
+    # Matches in the identifier rank above matches in the description; shorter paths first.
+    hits = sorted(((0 if all(t in path.lower() for t in terms) else 1, len(path), path)
+                   for path, text in _index if all(t in text for t in terms)))
+    if not hits:
+        hints = bundled_addons.search_hints(query)
+        # Models search in four or five words ('fcurves action layers animation') and got nothing
+        # (eval, 2026-09-27): rank by how many words match, then as above.
+        scored = sorted((-matched, -sum(t in path.lower() for t in terms), len(path), path)
+                        for path, text in _index for matched in [sum(t in text for t in terms)] if matched)
+        if not scored:
+            return [f"Nothing in bpy.types or bpy.ops matches {query!r}. Try fewer or different words.", *hints]
+        return ([f"Nothing matches every word of {query!r}; the entries that match the most of them, "
+                 "best first; pass one as `path` for details:"]
+                + hints
+                + [f"  {path} ({-matched} of {len(terms)} words)" for matched, _, _, path in scored[:MAX_PARTIAL_RESULTS]])
+    lines = [f"{len(hits)} match(es) for {query!r}" + (f", first {MAX_SEARCH_RESULTS}" if len(hits) > MAX_SEARCH_RESULTS else "")
+             + "; pass one as `path` for details:"]
+    return lines + ["  " + path for _, _, path in hits[:MAX_SEARCH_RESULTS]]
+
+
+def inspect_api(path: str = "", search: str = "") -> str:
+    """Raises ApiError with a message meant for the model."""
+    path, search = path.strip(), search.strip()
+    if bool(path) == bool(search):
+        raise ApiError("Pass exactly one of `path` (describe it) or `search` (find names).")
+    try:
+        if search:
+            lines = _search(search)
+        else:
+            package, path = bundled_addons.matching_path(path)
+            notice = bundled_addons.ensure_enabled(package) if package else ""
+            if package and package["id"] == "univ" and bpy.app.background:
+                return notice
+            # A package lookup has no RNA object; advertise its public operator family alongside
+            # the normal Python module description. Operator lookups still use live RNA.
+            try:
+                lines = _resolve(path)
+            except ApiError as ex:
+                if notice:
+                    raise ApiError(notice + "\n" + str(ex)) from ex
+                raise
+            if package and path == package["module"]:
+                lines.insert(0, bundled_addons.hint(package))
+            if notice:
+                lines.insert(0, notice)
+    except (bundled_addons.BundledAddonError, OSError, ValueError) as ex:
+        raise ApiError(str(ex)) from ex
+    text = "\n".join(lines)
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS] + f"\n... [{len(text) - MAX_CHARS} more chars; inspect a narrower path]"
+    return text
